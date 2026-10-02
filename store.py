@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 log = logging.getLogger("store")
 DB_NAME = "ai-studio-db.json"
+CAPTION = "База пользователей AI Studio. Обновляется сама — не удаляйте и не открепляйте."
 MSK = timezone(timedelta(hours=3))
 
 
@@ -17,6 +18,7 @@ class Store:
         self.users: dict = {}
         self._dirty = False
         self._task = None
+        self._soon = False
         self._msg_id = None
         self.tg = None          # async (method, **params) -> dict
         self.tg_upload = None   # async (method, files: dict, **params) -> dict
@@ -27,6 +29,7 @@ class Store:
         if not user or not user.get("id"):
             return
         uid, now = str(user["id"]), int(time.time())
+        new = uid not in self.users
         u = self.users.setdefault(uid, {"id": user["id"], "first_seen": now, "msgs": 0, "blocked": False, "today": {"d": today(), "n": 0}})
         u["name"] = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or u.get("name", "")
         u["username"] = user.get("username") or u.get("username", "")
@@ -35,7 +38,7 @@ class Store:
             u["msgs"] = u.get("msgs", 0) + 1
             t = u.get("today") or {}
             u["today"] = {"d": today(), "n": (t.get("n", 0) if t.get("d") == today() else 0) + 1}
-        self.mark()
+        self.mark(soon=new)
 
     def is_blocked(self, uid):
         return bool(self.users.get(str(uid), {}).get("blocked"))
@@ -54,8 +57,12 @@ class Store:
 
     def mark(self, soon=False):
         self._dirty = True
+        if self._task and soon and not self._soon:
+            self._task.cancel()
+            self._task = None
         if self._task is None:
-            self._task = asyncio.get_running_loop().create_task(self._later(3 if soon else 45))
+            self._soon = soon
+            self._task = asyncio.get_running_loop().create_task(self._later(3 if soon else 300))
 
     async def _later(self, delay):
         await asyncio.sleep(delay)
@@ -63,22 +70,28 @@ class Store:
         await self.save()
 
     async def save(self):
+        """Один закреплённый файл, который тихо обновляется (editMessageMedia) — без новых сообщений в чате."""
         if not (self._dirty and self.admins and self.tg):
             return
         self._dirty = False
         data = json.dumps({"v": 1, "saved": int(time.time()), "users": self.users}, ensure_ascii=False).encode()
+        doc = {"document": (DB_NAME, data, "application/json")}
+        chat = self.admins[0]
         try:
-            r = await self.tg_upload("sendDocument", {"document": (DB_NAME, data, "application/json")}, chat_id=self.admins[0],
-                                     disable_notification="true", caption="База пользователей AI Studio — не удаляйте и не открепляйте")
+            if self._msg_id:
+                r = await self.tg_upload("editMessageMedia", doc, chat_id=chat, message_id=self._msg_id,
+                                         media=json.dumps({"type": "document", "media": "attach://document", "caption": CAPTION}))
+                desc = str(r.get("description", ""))
+                if r.get("ok") or "not modified" in desc:
+                    return
+                log.info("db: edit failed (%s), sending new file", desc)
+            r = await self.tg_upload("sendDocument", doc, chat_id=chat, disable_notification="true", caption=CAPTION)
             if not r.get("ok"):
                 log.warning("db save failed: %s", r.get("description"))
                 self._dirty = True
                 return
-            mid = r["result"]["message_id"]
-            await self.tg("pinChatMessage", chat_id=self.admins[0], message_id=mid, disable_notification=True)
-            if self._msg_id and self._msg_id != mid:
-                await self.tg("deleteMessage", chat_id=self.admins[0], message_id=self._msg_id)
-            self._msg_id = mid
+            self._msg_id = r["result"]["message_id"]
+            await self.tg("pinChatMessage", chat_id=chat, message_id=self._msg_id, disable_notification=True)
         except Exception as e:
             self._dirty = True
             log.warning("db save error: %s", e)

@@ -479,6 +479,24 @@ async def on_cleanup(app):
     await http.close()
 
 
+_sdk_cache = {"body": None, "t": 0}
+
+
+async def tg_sdk(request):
+    """Скрипт Telegram WebApp через наш сервер — на случай, если telegram.org недоступен у пользователя."""
+    if not _sdk_cache["body"] or time.time() - _sdk_cache["t"] > 86400:
+        try:
+            async with http.get("https://telegram.org/js/telegram-web-app.js", timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    _sdk_cache.update(body=await r.read(), t=time.time())
+        except Exception as e:
+            log.warning("tg sdk fetch: %s", e)
+    if not _sdk_cache["body"]:
+        raise web.HTTPFound("https://telegram.org/js/telegram-web-app.js")
+    return web.Response(body=_sdk_cache["body"], content_type="application/javascript",
+                        headers={"Cache-Control": "public, max-age=3600"})
+
+
 _logo_cache: dict = {}
 LOGO_CDNS = ["https://unpkg.com/@lobehub/icons-static-svg@latest/icons/{}.svg",
              "https://registry.npmmirror.com/@lobehub/icons-static-svg/latest/files/icons/{}.svg"]
@@ -528,6 +546,7 @@ def make_app():
     app.router.add_get("/files/{fid}/{name}", serve_file)
     app.router.add_post("/tg/webhook", tg_webhook)
     app.router.add_get("/logo/{slug}.svg", logo)
+    app.router.add_get("/tg-sdk.js", tg_sdk)
     app.router.add_static("/static/", STATIC)
     return app
 
