@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,user-scalable=no">
+<title>AI Studio</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Unbounded:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+<div class="grain" aria-hidden="true"></div>
+
+<div id="app">
+  <header class="topbar">
+    <button class="icon-btn" id="btnMenu" aria-label="Меню"><i data-i="menu"></i></button>
+    <button class="model-chip" id="btnModel">
+      <span id="chipLogo"></span>
+      <span class="chip-text"><span class="model-name" id="modelName">Загрузка</span><span class="model-sub" id="modelSub"></span></span>
+      <i data-i="chevDown" class="chev"></i>
+    </button>
+    <button class="icon-btn" id="btnNew" aria-label="Новый чат"><i data-i="edit3"></i></button>
+  </header>
+
+  <main id="scroller">
+    <section id="empty" class="empty">
+      <div class="sphere-wrap"><canvas id="sphere"></canvas><div class="sphere-ring"></div></div>
+      <h1 class="hero"><span id="heroHello">Привет</span><br><span class="grad-text">чем займёмся?</span></h1>
+      <p class="typer-line"><span class="typer-prefix" id="typerPrefix">Попробуйте:</span> <span id="typer"></span><span class="typer-caret"></span></p>
+      <div class="suggest" id="suggest"></div>
+    </section>
+    <div id="messages"></div>
+    <div class="spacer"></div>
+  </main>
+  <button id="toBottom" class="to-bottom hidden" aria-label="Вниз"><i data-i="arrowDown"></i></button>
+
+  <footer class="composer-wrap">
+    <div class="attachments" id="attachments"></div>
+    <div class="composer" id="composer">
+      <button class="icon-btn attach" id="btnAttach" aria-label="Прикрепить"><i data-i="clip"></i></button>
+      <textarea id="input" rows="1" placeholder="Спросите что угодно"></textarea>
+      <button class="send" id="btnSend" aria-label="Отправить" disabled><i data-i="arrowUp" class="i-send"></i><i data-i="stop" class="i-stop"></i></button>
+    </div>
+    <input type="file" id="file" accept="image/*" multiple hidden>
+  </footer>
+</div>
+
+<div class="scrim" id="scrim"></div>
+
+<aside class="drawer" id="drawer">
+  <div class="brand">
+    <div class="brand-orb"></div>
+    <div><b>AI Studio</b><small id="userName"></small></div>
+  </div>
+  <button class="drawer-new" id="drawerNew"><i data-i="plus"></i>Новый чат</button>
+  <nav class="drawer-nav">
+    <button id="navGallery"><span class="nav-ic"><i data-i="image"></i></span>Галерея<span class="count" id="galleryCount"></span></button>
+    <button id="navSettings"><span class="nav-ic"><i data-i="settings"></i></span>Настройки и API</button>
+  </nav>
+  <div class="drawer-label">История</div>
+  <div class="chat-list" id="chatList"></div>
+</aside>
+
+<div class="sheet" id="sheetModels">
+  <div class="sheet-grip"></div>
+  <div class="sheet-head"><h2>Модели</h2><span class="pill" id="modelsCount"></span></div>
+  <div class="search"><i data-i="search"></i><input id="modelSearch" placeholder="gpt, claude, gemini, deepseek" autocomplete="off"></div>
+  <div class="chips" id="modelFilters"></div>
+  <div class="sheet-body" id="modelList"></div>
+</div>
+
+<div class="sheet tall" id="sheetSettings">
+  <div class="sheet-grip"></div>
+  <div class="sheet-head"><h2>Настройки</h2></div>
+  <div class="sheet-body pad">
+    <section class="card">
+      <div class="card-title"><span class="ct-ic"><i data-i="message"></i></span>Системный промпт</div>
+      <textarea id="setSystem" rows="3" placeholder="Например: ты — опытный помощник, отвечай кратко и по делу"></textarea>
+    </section>
+    <section class="card">
+      <div class="card-title"><span class="ct-ic"><i data-i="zap"></i></span>Температура<b class="val" id="tempVal"></b></div>
+      <input type="range" id="setTemp" min="0" max="2" step="0.1">
+      <div class="row hint"><span>Точнее</span><span>Креативнее</span></div>
+    </section>
+    <section class="card">
+      <div class="card-title"><span class="ct-ic"><i data-i="brain"></i></span>Глубина размышлений</div>
+      <div class="seg" id="setReason"><button data-v="off">Выкл</button><button data-v="low">Мало</button><button data-v="medium">Средне</button><button data-v="high">Много</button></div>
+      <label class="toggle"><input type="checkbox" id="setShowReason"><span></span>Показывать ход мыслей</label>
+    </section>
+    <section class="card">
+      <div class="card-title"><span class="ct-ic"><i data-i="layers"></i></span>Лимит ответа, токенов</div>
+      <input type="number" id="setMaxTok" placeholder="Без лимита" inputmode="numeric">
+    </section>
+    <section class="card">
+      <div class="card-title"><span class="ct-ic"><i data-i="key"></i></span>Свои API<button class="link" id="btnAddProvider">Добавить</button></div>
+      <p class="hint">Любой OpenAI-совместимый API. Ключи хранятся только на этом устройстве.</p>
+      <div id="providerList"></div>
+    </section>
+    <button class="btn ghost danger" id="btnClearAll"><i data-i="trash"></i>Удалить все чаты</button>
+  </div>
+</div>
+
+<div class="sheet tall" id="sheetProvider">
+  <div class="sheet-grip"></div>
+  <div class="sheet-head"><h2 id="provTitle">Новый API</h2></div>
+  <div class="sheet-body pad">
+    <div class="presets" id="presets"></div>
+    <label class="field"><span>Название</span><input id="provName" placeholder="OpenAI"></label>
+    <label class="field"><span>Base URL</span><input id="provUrl" placeholder="https://api.openai.com/v1" autocapitalize="off" autocomplete="off"></label>
+    <label class="field"><span>API ключ</span><input id="provKey" placeholder="sk-…" type="password" autocomplete="off"></label>
+    <label class="field"><span>Модели — через запятую или автоматически</span><textarea id="provModels" rows="3" placeholder="gpt-4o, gpt-4o-mini"></textarea></label>
+    <label class="toggle"><input type="checkbox" id="provVision" checked><span></span>Модели понимают изображения</label>
+    <div class="btn-row">
+      <button class="btn ghost" id="btnFetchModels"><i data-i="refresh"></i>Найти модели</button>
+      <button class="btn primary" id="btnSaveProvider"><i data-i="check"></i>Сохранить</button>
+    </div>
+    <button class="btn ghost danger hidden" id="btnDelProvider"><i data-i="trash"></i>Удалить этот API</button>
+  </div>
+</div>
+
+<section class="panel" id="panelGallery">
+  <header class="panel-head">
+    <button class="icon-btn" data-close><i data-i="chevLeft"></i></button><h2>Галерея</h2>
+    <div class="seg small" id="galFilter"><button data-v="all">Все</button><button data-v="gen">AI</button><button data-v="up">Мои</button></div>
+  </header>
+  <div class="gallery" id="galleryGrid"></div>
+  <div class="empty-small hidden" id="galleryEmpty"><div class="es-ic"><i data-i="image"></i></div>Здесь появятся загруженные<br>и сгенерированные изображения</div>
+</section>
+
+<div class="viewer" id="viewer">
+  <div class="viewer-bg" id="viewerBg"></div>
+  <div class="viewer-top"><span class="pill dark" id="viewerInfo"></span><button class="icon-btn light" id="viewerClose"><i data-i="x"></i></button></div>
+  <div class="viewer-stage" id="viewerStage"><img id="viewerImg" alt=""></div>
+  <button class="viewer-nav prev" id="viewerPrev"><i data-i="chevLeft"></i></button>
+  <button class="viewer-nav next" id="viewerNext"><i data-i="chevRight"></i></button>
+  <div class="viewer-bar">
+    <button id="vSend"><span><i data-i="send"></i></span>В Telegram</button>
+    <button id="vDownload"><span><i data-i="download"></i></span>Скачать</button>
+    <button id="vUse"><span><i data-i="clip"></i></span>В сообщение</button>
+    <button id="vChat"><span><i data-i="message"></i></span>К чату</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/static/icons.js"></script>
+<script src="/static/md.js"></script>
+<script src="/static/fx.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
