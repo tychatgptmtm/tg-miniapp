@@ -9,6 +9,7 @@ import aiohttp
 from aiohttp import web
 
 from store import Store
+import chatbot
 from tools import TOOLS, FILES_DIR, run_tool, tool_label, tool_prompt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -70,8 +71,6 @@ async def auth_mw(request, handler):
                 return web.json_response({"error": "Доступ ограничен администратором", "blocked": True}, status=403)
         request["user"] = user
     resp = await handler(request)
-    if request.path in ("/", "/index.html") or request.path.startswith("/static/"):
-        resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
@@ -127,8 +126,14 @@ async def api_admin_block(request):
 
 
 async def api_models(request):
+    resp = web.json_response(await get_models(), headers={"Cache-Control": "private, max-age=600"})
+    resp.enable_compression()
+    return resp
+
+
+async def get_models():
     if _models_cache["data"] and time.time() - _models_cache["t"] < 1800:
-        return web.json_response(_models_cache["data"])
+        return _models_cache["data"]
     try:
         async with http.get(f"{OR_URL}/models", timeout=aiohttp.ClientTimeout(total=20)) as r:
             raw = (await r.json())["data"]
@@ -144,10 +149,10 @@ async def api_models(request):
                 "free": free, "price": [pr.get("prompt"), pr.get("completion")], "created": m.get("created", 0),
             })
         _models_cache.update(t=time.time(), data=out)
-        return web.json_response(out)
+        return out
     except Exception as e:
         log.warning("models fetch failed: %s", e)
-        return web.json_response(_models_cache["data"] or FALLBACK_MODELS)
+        return _models_cache["data"] or FALLBACK_MODELS
 
 
 async def api_provider_models(request):
@@ -182,13 +187,13 @@ async def sse(resp, obj):
     await resp.write(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
 
 
-async def api_chat(request):
-    body = await request.json()
-    user = request["user"]
-    store.touch(user, msg=True)
+async def agent_events(body, user):
+    """Общий «мозг»: запрос к модели + инструменты. Выдаёт события (чанки OpenRouter, x_tool, x_file, error).
+    Ошибка до начала ответа приходит с ключом _status."""
     base, key = provider_target(body)
     if base == OR_URL and not key:
-        return web.json_response({"error": "На сервере не задан OPENROUTER_API_KEY"}, status=500)
+        yield {"error": {"message": "На сервере не задан OPENROUTER_API_KEY"}, "_status": 500}
+        return
     payload = {"model": body["model"], "stream": True}
     for k in ("temperature", "max_tokens", "modalities", "reasoning", "top_p"):
         if body.get(k) is not None:
@@ -199,100 +204,115 @@ async def api_chat(request):
     use_tools = bool(body.get("tools")) and not payload.get("modalities")
     base_msgs = body["messages"]
     messages = ([{"role": "system", "content": tool_prompt()}] + base_msgs) if use_tools else list(base_msgs)
+    started = False
+    for step in range(7):
+        p = dict(payload, messages=messages)
+        if use_tools:
+            p["tools"] = TOOLS
+        try:
+            upstream = await http.post(f"{base}/chat/completions", json=p, headers=headers_for(key),
+                                       timeout=aiohttp.ClientTimeout(total=600, sock_read=300))
+        except Exception as e:
+            yield {"error": {"message": f"Сеть: {e}"}, **({} if started else {"_status": 502})}
+            return
+        if upstream.status != 200:
+            msg = upstream_error(await upstream.text(), upstream.status)
+            upstream.release()
+            if use_tools and re.search(r"tool|function", msg, re.I):
+                # модель не поддерживает инструменты — повторяем без них
+                use_tools = False
+                messages = [m for m in messages if m.get("role") != "tool" and not m.get("tool_calls")]
+                messages = [m for m in messages if not (m.get("role") == "system" and "AI Studio. Сейчас" in str(m.get("content")))]
+                continue
+            yield {"error": {"message": msg}, **({} if started else {"_status": upstream.status})}
+            return
+        started = True
+        content, rdetails, calls, buf = "", [], {}, b""
+        try:
+            async for chunk in upstream.content.iter_any():
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line.startswith(b"data:"):
+                        continue
+                    d = line[5:].strip()
+                    if not d or d == b"[DONE]":
+                        continue
+                    try:
+                        j = json.loads(d)
+                    except Exception:
+                        continue
+                    ch = (j.get("choices") or [{}])[0]
+                    delta = ch.get("delta") or ch.get("message") or {}
+                    tcs = delta.pop("tool_calls", None)
+                    for tc in tcs or []:
+                        c = calls.setdefault(tc.get("index", len(calls)), {"id": "", "name": "", "args": ""})
+                        c["id"] = tc.get("id") or c["id"]
+                        fn = tc.get("function") or {}
+                        c["name"] += fn.get("name") or ""
+                        c["args"] += fn.get("arguments") or ""
+                    if isinstance(delta.get("content"), str):
+                        content += delta["content"]
+                    if delta.get("reasoning_details"):
+                        rdetails.extend(delta["reasoning_details"])
+                    if tcs and not delta.get("content") and not delta.get("reasoning") and not j.get("error"):
+                        continue
+                    yield j
+        finally:
+            upstream.release()
+        if not calls:
+            return
+        tool_calls = [{"id": c["id"] or f"call_{step}_{i}", "type": "function",
+                       "function": {"name": c["name"], "arguments": c["args"] or "{}"}} for i, c in sorted(calls.items())]
+        am = {"role": "assistant", "content": content or "", "tool_calls": tool_calls}
+        if rdetails:
+            am["reasoning_details"] = rdetails
+        messages = messages + [am]
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"] or "{}")
+            except Exception:
+                args = {}
+            yield {"x_tool": {"id": tc["id"], "name": name, "label": tool_label(name, args), "status": "start"}}
+            result, files = await run_tool(http, name, args, PUBLIC_URL)
+            for f in files:
+                data = f.pop("_data")
+                yield {"x_file": f}
+                if user.get("id") and BOT_TOKEN:
+                    asyncio.get_running_loop().create_task(
+                        tg_upload("sendDocument", {"document": (f["name"], data, "application/octet-stream")},
+                                  chat_id=user["id"], caption="Файл из AI Studio"))
+            yield {"x_tool": {"id": tc["id"], "status": "done"}}
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)[:16000]})
+        if content:
+            yield {"choices": [{"delta": {"content": "\n\n"}}]}
+
+
+async def api_chat(request):
+    body = await request.json()
+    user = request["user"]
+    store.touch(user, msg=True)
+    gen = agent_events(body, user)
     resp = None
     try:
-        for step in range(7):
-            p = dict(payload, messages=messages)
-            if use_tools:
-                p["tools"] = TOOLS
-            try:
-                upstream = await http.post(f"{base}/chat/completions", json=p, headers=headers_for(key),
-                                           timeout=aiohttp.ClientTimeout(total=600, sock_read=300))
-            except Exception as e:
-                if resp is None:
-                    return web.json_response({"error": f"Сеть: {e}"}, status=502)
-                await sse(resp, {"error": {"message": f"Сеть: {e}"}})
-                break
-            if upstream.status != 200:
-                msg = upstream_error(await upstream.text(), upstream.status)
-                upstream.release()
-                if use_tools and re.search(r"tool|function", msg, re.I):
-                    # модель не поддерживает инструменты — повторяем без них
-                    use_tools, messages = False, [m for m in messages if m.get("role") != "tool" and not m.get("tool_calls")]
-                    messages = [m for m in messages if not (m.get("role") == "system" and "AI Studio. Сейчас" in str(m.get("content")))]
-                    continue
-                if resp is None:
-                    return web.json_response({"error": msg}, status=upstream.status)
-                await sse(resp, {"error": {"message": msg}})
-                break
+        async for ev in gen:
             if resp is None:
+                if "_status" in ev:
+                    return web.json_response({"error": ev["error"]["message"]}, status=ev["_status"])
                 resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache",
                                                    "X-Accel-Buffering": "no"})
                 await resp.prepare(request)
-            content, rdetails, calls, buf = "", [], {}, b""
-            try:
-                async for chunk in upstream.content.iter_any():
-                    buf += chunk
-                    while b"\n" in buf:
-                        line, buf = buf.split(b"\n", 1)
-                        line = line.strip()
-                        if not line.startswith(b"data:"):
-                            continue
-                        d = line[5:].strip()
-                        if not d or d == b"[DONE]":
-                            continue
-                        try:
-                            j = json.loads(d)
-                        except Exception:
-                            continue
-                        ch = (j.get("choices") or [{}])[0]
-                        delta = ch.get("delta") or ch.get("message") or {}
-                        tcs = delta.pop("tool_calls", None)
-                        for tc in tcs or []:
-                            c = calls.setdefault(tc.get("index", len(calls)), {"id": "", "name": "", "args": ""})
-                            c["id"] = tc.get("id") or c["id"]
-                            fn = tc.get("function") or {}
-                            c["name"] += fn.get("name") or ""
-                            c["args"] += fn.get("arguments") or ""
-                        if isinstance(delta.get("content"), str):
-                            content += delta["content"]
-                        if delta.get("reasoning_details"):
-                            rdetails.extend(delta["reasoning_details"])
-                        if tcs and not delta.get("content") and not delta.get("reasoning") and not j.get("error"):
-                            continue
-                        await sse(resp, j)
-            finally:
-                upstream.release()
-            if not calls:
-                break
-            tool_calls = [{"id": c["id"] or f"call_{step}_{i}", "type": "function",
-                           "function": {"name": c["name"], "arguments": c["args"] or "{}"}} for i, c in sorted(calls.items())]
-            am = {"role": "assistant", "content": content or "", "tool_calls": tool_calls}
-            if rdetails:
-                am["reasoning_details"] = rdetails
-            messages = messages + [am]
-            for tc in tool_calls:
-                name = tc["function"]["name"]
-                try:
-                    args = json.loads(tc["function"]["arguments"] or "{}")
-                except Exception:
-                    args = {}
-                await sse(resp, {"x_tool": {"id": tc["id"], "name": name, "label": tool_label(name, args), "status": "start"}})
-                result, files = await run_tool(http, name, args, PUBLIC_URL)
-                for f in files:
-                    data = f.pop("_data")
-                    await sse(resp, {"x_file": f})
-                    if user.get("id") and BOT_TOKEN:
-                        asyncio.get_running_loop().create_task(
-                            tg_upload("sendDocument", {"document": (f["name"], data, "application/octet-stream")},
-                                      chat_id=user["id"], caption="Файл из AI Studio"))
-                await sse(resp, {"x_tool": {"id": tc["id"], "status": "done"}})
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(result)[:16000]})
-            if content:
-                await sse(resp, {"choices": [{"delta": {"content": "\n\n"}}]})
+            await sse(resp, ev)
+        if resp is None:
+            resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await resp.prepare(request)
         await resp.write(b"data: [DONE]\n\n")
     except (ConnectionResetError, asyncio.CancelledError):
         pass
+    finally:
+        await gen.aclose()
     return resp
 
 
@@ -335,25 +355,28 @@ BOT_NAME = os.getenv("BOT_NAME", "AI Studio")
 SHORT_DESC = "Сотни нейросетей в одном окне: чат, анализ фото и генерация изображений."
 DESC = ("AI Studio — личная студия нейросетей прямо в Telegram.\n\n"
         "• GPT, Claude, Gemini, DeepSeek, Grok и сотни других моделей\n"
-        "• Анализ фотографий и генерация изображений\n"
-        "• Галерея, история диалогов, свои API-ключи\n\n"
+        "• Анализ фото и файлов, генерация изображений\n"
+        "• Создание файлов и архивов, поиск в интернете\n"
+        "• Можно общаться и прямо в чате с ботом\n\n"
         "Нажмите «Запустить», чтобы начать.")
 COMMANDS = [{"command": "start", "description": "Главное меню"},
             {"command": "app", "description": "Открыть AI Studio"},
+            {"command": "new", "description": "Новый диалог в чате"},
+            {"command": "model", "description": "Нейросеть для чата"},
             {"command": "help", "description": "Как пользоваться"},
             {"command": "about", "description": "О боте"}]
 HELP = ("<b>Как пользоваться AI Studio</b>\n\n"
         "<b>1. Выберите модель.</b> Нажмите на название модели вверху приложения. Фильтры помогут найти "
         "бесплатные модели, модели, которые видят фото, и модели, которые рисуют.\n\n"
         "<b>2. Пишите или прикладывайте фото.</b> Скрепка слева от поля ввода — до 6 изображений за раз.\n\n"
-        "<b>3. Генерируйте картинки.</b> Выберите модель с иконкой волшебной палочки и опишите, что нарисовать. "
-        "Чтобы изменить картинку, просто напишите, что поправить.\n\n"
-        "<b>4. Галерея.</b> Все изображения собраны в меню → Галерея. Оттуда их можно отправить сюда файлом.\n\n"
-        "<b>5. Файлы и интернет.</b> Попросите создать документ, таблицу, код или архив — ИИ сделает файл и пришлёт "
+        "<b>3. Генерируйте картинки.</b> Выберите модель с иконкой волшебной палочки и опишите, что нарисовать.\n\n"
+        "<b>4. Файлы и интернет.</b> Попросите создать документ, таблицу, код или архив — ИИ сделает файл и пришлёт "
         "его сюда. Он также умеет искать в интернете и читать сайты по ссылке.\n\n"
-        "<b>6. Свои API.</b> Меню → Настройки и API → Добавить: OpenAI, Gemini, Groq, DeepSeek и другие.")
+        "<b>5. Свои API.</b> Меню → Настройки и API → Добавить: OpenAI, Gemini, Groq, DeepSeek и другие.\n\n"
+        "<b>Без приложения.</b> Можно писать прямо сюда, в чат — бот ответит. Понимает фото, PDF, Word, Excel и код. "
+        "/new — новый диалог, /model — выбрать нейросеть.")
 ABOUT = ("<b>AI Studio</b>\n\nРаботает через OpenRouter — единый доступ к сотням нейросетей. "
-         "История чатов хранится только на вашем устройстве.")
+         "История чатов приложения хранится только на вашем устройстве.")
 
 
 def esc_html(t: str) -> str:
@@ -400,9 +423,10 @@ async def send_welcome(chat_id, first_name):
                "<b>Что внутри</b>\n"
                "— сотни моделей: GPT, Claude, Gemini, DeepSeek, Grok\n"
                "— анализ фото и генерация изображений\n"
-               "— галерея и история диалогов\n"
-               "— подключение своих API-ключей\n\n"
-               "Нажмите кнопку ниже — приложение откроется прямо здесь.")
+               "— создание файлов и поиск в интернете\n"
+               "— галерея и история диалогов\n\n"
+               "Нажмите кнопку ниже — приложение откроется прямо здесь. "
+               "А если удобнее — просто напишите сообщение в этот чат.")
     r = await tg("sendPhoto", chat_id=chat_id, photo=f"{PUBLIC_URL}/static/banner.jpg", caption=caption,
                  parse_mode="HTML", reply_markup=app_kb())
     if not r.get("ok"):
@@ -415,28 +439,41 @@ async def tg_webhook(request):
     upd = await request.json()
     try:
         if cq := upd.get("callback_query"):
+            cuid = cq["from"]["id"]
+            if cuid not in ADMINS and (ALLOWED and cuid not in ALLOWED or store.is_blocked(cuid)):
+                await tg("answerCallbackQuery", callback_query_id=cq["id"], text="Доступ ограничен")
+                return web.Response(text="ok")
+            if cq.get("message") and await chatbot.on_callback(cq):
+                return web.Response(text="ok")
             await tg("answerCallbackQuery", callback_query_id=cq["id"])
             text = HELP if cq.get("data") == "help" else ABOUT
             await tg("sendMessage", chat_id=cq["message"]["chat"]["id"], text=text, parse_mode="HTML", reply_markup=app_kb(False))
             return web.Response(text="ok")
         msg = upd.get("message") or {}
-        if not msg.get("chat"):
+        if not msg.get("chat") or msg["chat"].get("type") != "private":
             return web.Response(text="ok")
         chat_id, user = msg["chat"]["id"], msg.get("from", {})
         store.touch(user)
         if user.get("id") not in ADMINS and (ALLOWED and user.get("id") not in ALLOWED or store.is_blocked(user.get("id"))):
             await tg("sendMessage", chat_id=chat_id, text="Доступ к боту ограничен.")
             return web.Response(text="ok")
-        cmd = (msg.get("text") or "").split()[0].split("@")[0].lower() if msg.get("text") else ""
-        if cmd == "/start":
+        txt = (msg.get("text") or "").strip()
+        cmd = txt.split()[0].split("@")[0].lower() if txt.startswith("/") else ""
+        arg = txt.split(maxsplit=1)[1] if cmd and len(txt.split(maxsplit=1)) > 1 else ""
+        if cmd and await chatbot.on_command(cmd, arg, chat_id, user):
+            pass
+        elif cmd == "/start":
             await send_welcome(chat_id, user.get("first_name"))
         elif cmd == "/help":
             await tg("sendMessage", chat_id=chat_id, text=HELP, parse_mode="HTML", reply_markup=app_kb(False))
         elif cmd == "/about":
             await tg("sendMessage", chat_id=chat_id, text=ABOUT, parse_mode="HTML", reply_markup=app_kb(False))
+        elif cmd == "/app":
+            await tg("sendMessage", chat_id=chat_id, reply_markup=app_kb(False), text="Откройте AI Studio кнопкой ниже.")
+        elif cmd:
+            await tg("sendMessage", chat_id=chat_id, text="Не знаю такую команду. Список — /help")
         else:
-            await tg("sendMessage", chat_id=chat_id, parse_mode="HTML", reply_markup=app_kb(False),
-                     text="Все диалоги с нейросетями — в приложении. Откройте его кнопкой ниже или через кнопку меню слева от поля ввода.")
+            asyncio.get_running_loop().create_task(chatbot.answer(chat_id, user, msg))
     except Exception as e:
         log.exception("webhook error: %s", e)
     return web.Response(text="ok")
@@ -466,6 +503,8 @@ async def on_startup(app):
             log.info("webhook: %s, menu: %s", r1.get("ok"), r2.get("ok"))
             asyncio.create_task(setup_bot_profile())
             store.tg, store.tg_upload, store.download, store.admins = tg, tg_upload, tg_download, ADMINS
+            chatbot.init(tg=tg, tg_upload=tg_upload, download=tg_download, agent=agent_events, store=store,
+                         models=get_models, admins=ADMINS, default_model=DEFAULT_MODEL, public_url=PUBLIC_URL)
             await store.load()
         except Exception as e:
             log.error("bot setup failed: %s", e)
@@ -526,8 +565,49 @@ async def logo(request):
     return web.Response(body=body, content_type="image/svg+xml", headers={"Cache-Control": "public, max-age=604800"})
 
 
+_static: dict = {}
+CTYPES = {".js": "application/javascript", ".css": "text/css", ".html": "text/html", ".jpg": "image/jpeg",
+          ".png": "image/png", ".svg": "image/svg+xml", ".txt": "text/plain"}
+
+
+def load_static():
+    """Читаем статику в память один раз: сжимаем gzip и ставим версии — телефон кэширует файлы надолго."""
+    import gzip, hashlib
+    for name in os.listdir(STATIC):
+        path = os.path.join(STATIC, name)
+        if not os.path.isfile(path):
+            continue
+        raw = open(path, "rb").read()
+        ext = os.path.splitext(name)[1].lower()
+        gz = gzip.compress(raw, 9) if ext in (".js", ".css", ".html", ".svg", ".txt") else None
+        _static[name] = {"raw": raw, "gz": gz, "ct": CTYPES.get(ext, "application/octet-stream"),
+                         "v": hashlib.md5(raw).hexdigest()[:10]}
+    html = _static["index.html"]["raw"].decode()
+    for name, f in _static.items():
+        html = html.replace(f'"/static/{name}"', f'"/static/{name}?v={f["v"]}"')
+    import gzip as _g
+    _static["index.html"].update(raw=html.encode(), gz=_g.compress(html.encode(), 9))
+
+
+def send_static(request, name, cache):
+    f = _static.get(name)
+    if not f:
+        raise web.HTTPNotFound()
+    use_gz = f["gz"] is not None and "gzip" in request.headers.get("Accept-Encoding", "")
+    h = {"Cache-Control": cache, "Vary": "Accept-Encoding"}
+    if use_gz:
+        h["Content-Encoding"] = "gzip"
+    return web.Response(body=f["gz"] if use_gz else f["raw"], content_type=f["ct"], headers=h,
+                        charset="utf-8" if f["ct"].startswith(("text/", "application/javascript")) else None)
+
+
 async def index(request):
-    return web.FileResponse(os.path.join(STATIC, "index.html"))
+    return send_static(request, "index.html", "no-cache")
+
+
+async def static_file(request):
+    cache = "public, max-age=31536000, immutable" if request.query.get("v") else "public, max-age=600"
+    return send_static(request, request.match_info["name"], cache)
 
 
 def make_app():
@@ -547,7 +627,8 @@ def make_app():
     app.router.add_post("/tg/webhook", tg_webhook)
     app.router.add_get("/logo/{slug}.svg", logo)
     app.router.add_get("/tg-sdk.js", tg_sdk)
-    app.router.add_static("/static/", STATIC)
+    load_static()
+    app.router.add_get("/static/{name}", static_file)
     return app
 
 
