@@ -2,6 +2,7 @@
 Отдаёт мини-апп, проксирует запросы к OpenRouter / любым OpenAI-совместимым API,
 проверяет подпись Telegram и обслуживает бота (вебхук).
 """
+import uuid
 import asyncio, base64, hashlib, hmac, json, logging, os, re, time
 from urllib.parse import parse_qsl
 
@@ -290,30 +291,95 @@ async def agent_events(body, user):
             yield {"choices": [{"delta": {"content": "\n\n"}}]}
 
 
+# ---------- фоновые ответы: генерация продолжается, даже если приложение свернули ----------
+JOBS: dict = {}
+
+
+class Job:
+    def __init__(self, uid):
+        self.id, self.uid, self.events, self.done = uuid.uuid4().hex, uid, [], False
+        self.t, self.task, self._wake = time.time(), None, asyncio.Event()
+
+    def push(self, ev):
+        ev.pop("_status", None)
+        self.events.append(ev)
+        w, self._wake = self._wake, asyncio.Event()
+        w.set()
+
+    async def run(self, body, user):
+        try:
+            async for ev in agent_events(body, user):
+                self.push(ev)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.exception("job failed")
+            self.push({"error": {"message": f"Ошибка сервера: {e}"}})
+        finally:
+            self.done = True
+            self.t = time.time()
+            self.push({"x_end": True})
+
+
+def cleanup_jobs():
+    now = time.time()
+    for jid, jb in list(JOBS.items()):
+        if (jb.done and now - jb.t > 900) or now - jb.t > 1800:
+            if jb.task and not jb.task.done():
+                jb.task.cancel()
+            JOBS.pop(jid, None)
+
+
+async def stream_job(request, job, start):
+    resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+                                       "X-Accel-Buffering": "no"})
+    await resp.prepare(request)
+    i = max(0, int(start))
+    try:
+        while True:
+            while i < len(job.events):
+                ev = job.events[i]
+                i += 1
+                if ev.get("x_end"):
+                    await resp.write(b"data: [DONE]\n\n")
+                    return resp
+                await sse(resp, ev)
+            w = job._wake
+            try:
+                await asyncio.wait_for(w.wait(), 15)
+            except asyncio.TimeoutError:
+                await resp.write(b": ping\n\n")
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass  # приложение свернули — ответ продолжает генерироваться на сервере
+    return resp
+
+
 async def api_chat(request):
     body = await request.json()
     user = request["user"]
     store.touch(user, msg=True)
-    gen = agent_events(body, user)
-    resp = None
-    try:
-        async for ev in gen:
-            if resp is None:
-                if "_status" in ev:
-                    return web.json_response({"error": ev["error"]["message"]}, status=ev["_status"])
-                resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache",
-                                                   "X-Accel-Buffering": "no"})
-                await resp.prepare(request)
-            await sse(resp, ev)
-        if resp is None:
-            resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
-            await resp.prepare(request)
-        await resp.write(b"data: [DONE]\n\n")
-    except (ConnectionResetError, asyncio.CancelledError):
-        pass
-    finally:
-        await gen.aclose()
-    return resp
+    cleanup_jobs()
+    job = Job(user.get("id"))
+    JOBS[job.id] = job
+    job.push({"x_job": job.id})
+    job.task = asyncio.get_running_loop().create_task(job.run(body, user))
+    return await stream_job(request, job, 0)
+
+
+async def api_chat_resume(request):
+    body = await request.json()
+    job = JOBS.get(str(body.get("job")))
+    if not job or job.uid != request["user"].get("id"):
+        return web.json_response({"error": "Ответ не найден — возможно, сервер перезапускался. Отправьте сообщение ещё раз."}, status=404)
+    return await stream_job(request, job, body.get("from", 0))
+
+
+async def api_chat_cancel(request):
+    body = await request.json()
+    job = JOBS.get(str(body.get("job")))
+    if job and job.uid == request["user"].get("id") and job.task and not job.task.done():
+        job.task.cancel()
+    return web.json_response({"ok": True})
 
 
 async def serve_file(request):
@@ -620,6 +686,8 @@ def make_app():
     app.router.add_get("/api/models", api_models)
     app.router.add_post("/api/provider-models", api_provider_models)
     app.router.add_post("/api/chat", api_chat)
+    app.router.add_post("/api/chat/resume", api_chat_resume)
+    app.router.add_post("/api/chat/cancel", api_chat_cancel)
     app.router.add_post("/api/send-photo", api_send_photo)
     app.router.add_get("/api/admin/users", api_admin_users)
     app.router.add_post("/api/admin/block", api_admin_block)
