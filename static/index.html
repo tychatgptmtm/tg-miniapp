@@ -58,6 +58,7 @@
   <nav class="drawer-nav">
     <button id="navGallery"><span class="nav-ic"><i data-i="image"></i></span>Галерея<span class="count" id="galleryCount"></span></button>
     <button id="navSettings"><span class="nav-ic"><i data-i="settings"></i></span>Настройки и API</button>
+    <button id="navAdmin" class="hidden"><span class="nav-ic"><i data-i="shield"></i></span>Пользователи<span class="count" id="adminCount"></span></button>
   </nav>
   <div class="drawer-label">История</div>
   <div class="chat-list" id="chatList"></div>
@@ -88,6 +89,11 @@
       <div class="card-title"><span class="ct-ic"><i data-i="brain"></i></span>Глубина размышлений</div>
       <div class="seg" id="setReason"><button data-v="off">Выкл</button><button data-v="low">Мало</button><button data-v="medium">Средне</button><button data-v="high">Много</button></div>
       <label class="toggle"><input type="checkbox" id="setShowReason"><span></span>Показывать ход мыслей</label>
+    </section>
+    <section class="card">
+      <div class="card-title"><span class="ct-ic"><i data-i="wrench"></i></span>Инструменты</div>
+      <label class="toggle"><input type="checkbox" id="setTools"><span></span>Файлы, архивы и интернет</label>
+      <p class="hint">AI сможет создавать файлы (txt, docx, xlsx, zip и др.), искать в интернете и читать сайты. Если модель не умеет — включится обычный режим.</p>
     </section>
     <section class="card">
       <div class="card-title"><span class="ct-ic"><i data-i="layers"></i></span>Лимит ответа, токенов</div>
@@ -128,6 +134,25 @@
   <div class="gallery" id="galleryGrid"></div>
   <div class="empty-small hidden" id="galleryEmpty"><div class="es-ic"><i data-i="image"></i></div>Здесь появятся загруженные<br>и сгенерированные изображения</div>
 </section>
+
+<section class="panel" id="panelAdmin">
+  <header class="panel-head">
+    <button class="icon-btn" data-close><i data-i="chevLeft"></i></button><h2>Пользователи</h2>
+    <button class="icon-btn" id="adminRefresh" style="margin-left:auto"><i data-i="refresh"></i></button>
+  </header>
+  <div class="admin-body">
+    <div class="stats" id="adminStats"></div>
+    <div class="search"><i data-i="search"></i><input id="adminSearch" placeholder="Имя, @username или ID" autocomplete="off"></div>
+    <div class="seg small" id="adminFilter"><button data-v="all" class="on">Все</button><button data-v="active">Активные</button><button data-v="blocked">Заблокированы</button></div>
+    <div id="adminList"></div>
+  </div>
+</section>
+
+<div class="blocked hidden" id="blockedScreen">
+  <div class="bl-ic"><i data-i="ban"></i></div>
+  <h2>Доступ закрыт</h2>
+  <p id="blockedText">Администратор ограничил доступ к AI Studio.</p>
+</div>
 
 <div class="viewer" id="viewer">
   <div class="viewer-bg" id="viewerBg"></div>

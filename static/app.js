@@ -29,9 +29,11 @@ async function api(path, body, signal) {
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!r.ok) {
-    let msg = `HTTP ${r.status}`;
-    try { const j = await r.json(); msg = j.error || msg; } catch { }
-    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    let msg = `HTTP ${r.status}`, j = {};
+    try { j = await r.json(); msg = j.error || msg; } catch { }
+    const err = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)); err.status = r.status;
+    if (j.blocked) { err.blocked = true; showBlocked(err.message); }
+    throw err;
   }
   return r;
 }
@@ -61,7 +63,7 @@ const DB = (() => {
 const S = {
   config: { defaultModel: 'stealth/space-bunny-alpha' },
   chats: [], chat: null, models: [], orModels: [], favs: new Set(), providers: [],
-  settings: { system: '', temp: 0.7, reason: 'off', showReason: true, maxTok: '' },
+  settings: { system: '', temp: 0.7, reason: 'off', showReason: true, maxTok: '', tools: true },
   lastModel: null, attachments: [], streaming: null, filter: 'all', galFilter: 'all', reasonOpen: {},
 };
 const saveSettings = () => DB.set('settings', S.settings);
@@ -238,7 +240,7 @@ function msgEl(m) {
     el.innerHTML = `<div class="body">${imgsHtml(m.images, '')}${m.content ? `<div class="bubble">${esc(m.content)}</div>` : ''}
       <div class="actions"><button data-act="copy">${icon('copy')}</button><button data-act="edit">${icon('pen')}</button></div></div>`;
   } else {
-    el.innerHTML = `<div class="ai-ava"></div><div class="body"><div class="meta"></div><div class="s-reason"></div><div class="s-imgs"></div><div class="md"></div><div class="s-status"></div><div class="s-err"></div><div class="actions"></div></div>`;
+    el.innerHTML = `<div class="ai-ava"></div><div class="body"><div class="meta"></div><div class="s-reason"></div><div class="s-tools"></div><div class="s-imgs"></div><div class="md"></div><div class="s-files"></div><div class="s-status"></div><div class="s-err"></div><div class="actions"></div></div>`;
     el._imgCount = -1; patchAssistant(el, m);
   }
   return el;
@@ -263,6 +265,14 @@ function patchAssistant(el, m) {
   // images
   const n = m.images?.length || 0;
   if (n !== el._imgCount) { q('.s-imgs').innerHTML = imgsHtml(m.images, 'gen', el._imgCount !== -1); el._imgCount = n; }
+  // tools
+  const tl = m.tools || [], tk = tl.map(t => t.id + t.status).join();
+  if (tk !== el._toolKey) { el._toolKey = tk; q('.s-tools').innerHTML = tl.length ? `<div class="tools">${tl.map(t => `<div class="tool ${t.status === 'done' ? 'done' : 'run'}">
+      <span class="t-ic">${t.status === 'done' ? icon('check') : '<i class="spin"></i>'}</span>${icon(toolIcon(t.name))}<span class="${t.status === 'done' ? '' : 'shimmer'}">${esc(t.label || t.name)}</span></div>`).join('')}</div>` : ''; }
+  // files
+  const fl = m.files || [];
+  if (fl.length !== el._fileCount) { el._fileCount = fl.length; q('.s-files').innerHTML = fl.length ? `<div class="files">${fl.map((f, i) => `<button class="fcard" data-dl="${i}" style="--n:${i}">
+      <span class="f-ic ${fileKind(f.name)}">${icon(fileIcon(f.name))}<em>${esc(ext(f.name))}</em></span><span class="f-t"><b>${esc(f.name)}</b><small>${fmtSize(f.size)} · отправлен в чат с ботом</small></span><span class="f-dl">${icon('download')}</span></button>`).join('')}</div>` : ''; }
   // text + курсор
   const md = q('.md'); md.innerHTML = MD.render(m.content || '');
   if (m.pending && m.content) {
@@ -271,7 +281,7 @@ function patchAssistant(el, m) {
     if (t && /^(P|LI|H[1-4])$/.test(t.tagName)) t.insertAdjacentHTML('beforeend', CARET); else md.insertAdjacentHTML('beforeend', CARET);
   }
   // status
-  const state = m.pending && !n && model.imageOut ? 'gen' : m.pending && !m.content && !(m.reasoning && S.settings.showReason) ? 'think' : '';
+  const state = m.pending && !n && model.imageOut ? 'gen' : m.pending && !m.content && !(m.reasoning && S.settings.showReason) && !(m.tools || []).some(t => t.status !== 'done') ? 'think' : '';
   if (el._st !== state) {
     el._st = state; const st = q('.s-status');
     if (state === 'gen') { st.innerHTML = `<div class="gen-ph"><canvas></canvas><div class="gp-label">${icon('wand')}<span class="shimmer" style="--muted:#ddd;--text:#fff">Создаю изображение</span></div></div>`; FX.latent(st.querySelector('canvas')); }
@@ -281,6 +291,19 @@ function patchAssistant(el, m) {
   q('.s-err').innerHTML = m.error ? `<div class="err">${icon('alert')}<span>${esc(m.error)}</span></div>` : '';
   q('.actions').innerHTML = m.pending ? '' : `${m.content ? `<button data-act="copy">${icon('copy')}</button>` : ''}<button data-act="regen">${icon('refresh')}</button><button data-act="del">${icon('trash')}</button>`;
 }
+const ext = n => (n.match(/\.([a-z0-9]{1,5})$/i)?.[1] || 'file').toUpperCase();
+const fileKind = n => /\.(zip|rar|7z|tar|gz)$/i.test(n) ? 'k-zip' : /\.(xlsx|xls|csv)$/i.test(n) ? 'k-xls' : /\.(docx?|pdf|txt|md|rtf)$/i.test(n) ? 'k-doc' : /\.(py|js|ts|html|css|json|java|c|cpp|go|rs|sh|php|sql|xml|yaml|yml)$/i.test(n) ? 'k-code' : 'k-any';
+const fileIcon = n => ({ 'k-zip': 'archive', 'k-xls': 'sheet', 'k-code': 'code' })[fileKind(n)] || 'file';
+const toolIcon = n => ({ create_files: 'file', web_search: 'search', fetch_url: 'globe' })[n] || 'wrench';
+const fmtSize = b => b < 1024 ? `${b} Б` : b < 1048576 ? `${(b / 1024).toFixed(1)} КБ` : `${(b / 1048576).toFixed(1)} МБ`;
+function downloadFile(f) {
+  const url = new URL(f.url, location.href).href; haptic();
+  if (inTG && tg.downloadFile && tg.isVersionAtLeast?.('8.0')) {
+    try { tg.downloadFile({ url, file_name: f.name }, ok => ok && toast('Загрузка началась', 'download')); return; } catch { }
+  }
+  if (inTG && tg.openLink) { tg.openLink(url); return; }
+  const a = document.createElement('a'); a.href = url; a.download = f.name; a.target = '_blank'; a.click();
+}
 const findMsgEl = id => $('#messages').querySelector(`.msg[data-id="${id}"]`);
 
 $('#messages').addEventListener('click', e => {
@@ -288,6 +311,8 @@ $('#messages').addEventListener('click', e => {
   if (img) { openViewerBySrc(img.src); return; }
   const cp = e.target.closest('[data-copy]');
   if (cp) { copyText(cp.closest('.code').querySelector('code').textContent); cp.textContent = 'Готово'; setTimeout(() => cp.textContent = 'Копировать', 1500); return; }
+  const dl = e.target.closest('[data-dl]');
+  if (dl) { const m = S.chat.messages.find(x => x.id === dl.closest('.msg').dataset.id); const f = m?.files?.[+dl.dataset.dl]; if (f) downloadFile(f); return; }
   const a = e.target.closest('[data-act]'); if (!a) return;
   const id = a.closest('.msg').dataset.id, msgs = S.chat.messages, i = msgs.findIndex(m => m.id === id), m = msgs[i];
   const act = a.dataset.act;
@@ -378,14 +403,18 @@ function buildMessages(model) {
       const text = m.content || (m.images?.length ? 'Посмотри на изображение' : '');
       out.unshift(imgs.length ? { role: 'user', content: [{ type: 'text', text }, ...imgs.map(url => ({ type: 'image_url', image_url: { url } }))] }
         : { role: 'user', content: text + (m.images?.length && !model.vision ? ' [пользователь прикрепил изображение]' : '') });
-    } else out.unshift({ role: 'assistant', content: m.content || (m.images?.length ? '[сгенерировано изображение]' : '…') });
+    } else {
+      let c = m.content || (m.images?.length ? '[сгенерировано изображение]' : '');
+      if (m.files?.length) c += `\n\n[Созданы и отправлены пользователю файлы: ${m.files.map(f => f.name).join(', ')}]`;
+      out.unshift({ role: 'assistant', content: c.trim() || '…' });
+    }
   }
   if (sys) out.unshift({ role: 'system', content: sys });
   return out;
 }
 async function runCompletion() {
   const model = getModel();
-  const am = { id: uid(), role: 'assistant', content: '', reasoning: '', images: [], model: model.key, pending: true };
+  const am = { id: uid(), role: 'assistant', content: '', reasoning: '', images: [], tools: [], files: [], model: model.key, pending: true };
   const messages = buildMessages(model);
   S.chat.messages.push(am);
   const el = msgEl(am); $('#messages').appendChild(el); scrollBottom(true);
@@ -394,6 +423,7 @@ async function runCompletion() {
   const body = { model: model.id, messages, temperature: +S.settings.temp };
   if (+S.settings.maxTok > 0) body.max_tokens = +S.settings.maxTok;
   if (S.settings.reason !== 'off') body.reasoning = { effort: S.settings.reason };
+  if (S.settings.tools && !model.imageOut) body.tools = true;
   if (model.imageOut) body.modalities = model.textOut === false ? ['image'] : ['image', 'text'];
   if (model.provider !== 'or') { const p = S.providers.find(x => x.id === model.provider); body.provider = { baseUrl: p?.baseUrl, apiKey: p?.apiKey }; }
   let raf = 0;
@@ -411,6 +441,8 @@ async function runCompletion() {
         const d = line.slice(5).trim(); if (!d || d === '[DONE]') continue;
         let j; try { j = JSON.parse(d); } catch { continue; }
         if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+        if (j.x_tool) { const t = am.tools.find(x => x.id === j.x_tool.id); if (t) Object.assign(t, j.x_tool); else am.tools.push(j.x_tool); haptic('select'); schedule(); continue; }
+        if (j.x_file) { am.files.push(j.x_file); haptic('success'); schedule(); continue; }
         const ch = j.choices?.[0]; if (!ch) continue;
         const delta = ch.delta || ch.message || {};
         if (typeof delta.content === 'string') am.content += delta.content;
@@ -421,13 +453,14 @@ async function runCompletion() {
         schedule();
       }
     }
-    if (!am.content && !am.images.length) am.error = 'Пустой ответ. Попробуйте ещё раз или выберите другую модель.';
+    if (!am.content && !am.images.length && !am.files.length) am.error = 'Пустой ответ. Попробуйте ещё раз или выберите другую модель.';
     haptic('success');
   } catch (e) {
-    if (e.name === 'AbortError') { if (!am.content && !am.images.length) am.error = 'Остановлено'; }
+    if (e.name === 'AbortError') { if (!am.content && !am.images.length && !am.files.length) am.error = 'Остановлено'; }
     else { am.error = friendlyError(e.message); haptic('error'); }
   } finally {
     cancelAnimationFrame(raf);
+    am.tools.forEach(t => t.status = 'done'); if (!am.tools.length) delete am.tools; if (!am.files.length) delete am.files;
     am.pending = false; am.ms = Date.now() - t0; delete S.reasonOpen[am.id];
     S.streaming = null; updateSend(); sphere.setActive(false);
     const d = el.querySelector('details'); if (d) d.open = false;
@@ -492,6 +525,7 @@ $('#btnMenu').onclick = () => { renderChatList(); openLayer($('#drawer')); };
 $('#btnNew').onclick = () => { haptic('medium'); newChat(true); };
 $('#drawerNew').onclick = () => { newChat(); closeLayer($('#drawer')); };
 $('#navGallery').onclick = () => { closeLayer($('#drawer')); renderGallery(); openLayer($('#panelGallery')); };
+$('#navAdmin').onclick = () => { closeLayer($('#drawer')); openLayer($('#panelAdmin')); loadAdmin(); };
 $('#navSettings').onclick = () => { closeLayer($('#drawer')); renderSettings(); openLayer($('#sheetSettings')); };
 
 /* ---------- Gallery & viewer ---------- */
@@ -554,7 +588,7 @@ $('#vChat').onclick = () => {
 function renderSettings() {
   const s = S.settings;
   $('#setSystem').value = s.system; $('#setTemp').value = s.temp; $('#tempVal').textContent = (+s.temp).toFixed(1);
-  $('#setMaxTok').value = s.maxTok; $('#setShowReason').checked = s.showReason;
+  $('#setMaxTok').value = s.maxTok; $('#setShowReason').checked = s.showReason; $('#setTools').checked = s.tools;
   document.querySelectorAll('#setReason button').forEach(b => b.classList.toggle('on', b.dataset.v === s.reason));
   $('#providerList').innerHTML = S.providers.map(p => `<button class="prov" data-pid="${p.id}">${logo({ id: p.name, name: p.name, provider: p.id, providerName: p.name, baseUrl: p.baseUrl })}
     <div class="t"><b>${esc(p.name)}</b><small>${p.models.length} моделей · ${esc(p.baseUrl.replace(/^https?:\/\//, ''))}</small></div>${icon('chevRight')}</button>`).join('');
@@ -562,6 +596,7 @@ function renderSettings() {
 $('#setSystem').oninput = e => { S.settings.system = e.target.value; saveSettings(); };
 $('#setTemp').oninput = e => { S.settings.temp = +e.target.value; $('#tempVal').textContent = (+e.target.value).toFixed(1); saveSettings(); haptic('select'); };
 $('#setMaxTok').oninput = e => { S.settings.maxTok = e.target.value; saveSettings(); };
+$('#setTools').onchange = e => { S.settings.tools = e.target.checked; saveSettings(); haptic('select'); };
 $('#setShowReason').onchange = e => { S.settings.showReason = e.target.checked; saveSettings(); haptic('select'); };
 $('#setReason').onclick = e => { const b = e.target.closest('[data-v]'); if (!b) return; S.settings.reason = b.dataset.v; haptic('select'); saveSettings(); renderSettings(); };
 $('#btnClearAll').onclick = async () => { if (!await confirmBox('Удалить все чаты и изображения?')) return; await DB.clear(); S.chats = []; newChat(); renderChatList(); toast('Все чаты удалены', 'trash'); };
@@ -614,6 +649,54 @@ $('#btnDelProvider').onclick = async () => {
   buildModels(); renderSettings(); renderHeader(); closeLayer($('#sheetProvider'));
 };
 
+/* ---------- Admin ---------- */
+const AD = { users: [], admins: [], filter: 'all' };
+const ago = t => { if (!t) return '—'; const s = Date.now() / 1000 - t;
+  return s < 120 ? 'сейчас онлайн' : s < 3600 ? `${Math.floor(s / 60)} мин назад` : s < 86400 ? `${Math.floor(s / 3600)} ч назад` : s < 86400 * 30 ? `${Math.floor(s / 86400)} дн назад` : new Date(t * 1000).toLocaleDateString('ru'); };
+const plural = (n, a, b, c) => { const m = n % 10, h = n % 100; return m === 1 && h !== 11 ? a : m >= 2 && m <= 4 && (h < 10 || h >= 20) ? b : c; };
+async function loadAdmin() {
+  if (!AD.users.length) $('#adminList').innerHTML = '<div class="thinking" style="justify-content:center;padding:30px"><div class="dots"><i></i><i></i><i></i></div><span class="shimmer">Загружаю</span></div>';
+  try { const r = await (await api('/api/admin/users')).json(); AD.users = r.users; AD.admins = r.admins; renderStats(r.stats); renderAdmin(); }
+  catch (e) { $('#adminList').innerHTML = `<div class="err">${icon('alert')}<span>${esc(e.message)}</span></div>`; }
+}
+function renderStats(st) {
+  $('#adminCount').textContent = st.total || '';
+  $('#adminStats').innerHTML = [['users', 'Всего', st.total], ['activity', 'За 24 часа', st.active24], ['message', 'Сообщений сегодня', st.msgsToday], ['ban', 'Заблокированы', st.blocked]]
+    .map(([ic, t, v], i) => `<div class="stat" style="--n:${i}"><span class="st-ic">${icon(ic)}</span><b>${v ?? 0}</b><small>${t}</small></div>`).join('');
+}
+function renderAdmin() {
+  document.querySelectorAll('#adminFilter button').forEach(b => b.classList.toggle('on', b.dataset.v === AD.filter));
+  const q = $('#adminSearch').value.trim().toLowerCase().replace(/^@/, ''), day = Date.now() / 1000 - 86400;
+  let list = AD.users;
+  if (AD.filter === 'active') list = list.filter(u => u.last_seen > day);
+  if (AD.filter === 'blocked') list = list.filter(u => u.blocked);
+  if (q) list = list.filter(u => `${u.name} ${u.username} ${u.id}`.toLowerCase().includes(q));
+  $('#adminList').innerHTML = list.length ? list.map((u, i) => {
+    const adm = AD.admins.includes(u.id), on = u.last_seen > Date.now() / 1000 - 300, nm = u.name || (u.username ? '@' + u.username : 'ID ' + u.id);
+    return `<div class="urow ${u.blocked ? 'blk' : ''}" style="--n:${Math.min(i, 14)}">
+      <span class="u-ava" style="--h:${(u.id * 47) % 360}">${esc((nm.replace('@', '')[0] || '?').toUpperCase())}${on ? '<i class="online"></i>' : ''}</span>
+      <span class="u-t"><b>${esc(nm)}${adm ? '<em class="badge">админ</em>' : ''}${u.blocked ? '<em class="badge red">блок</em>' : ''}</b>
+      <small>${u.username ? '@' + esc(u.username) + ' · ' : ''}${ago(u.last_seen)} · ${u.msgs || 0} ${plural(u.msgs || 0, 'сообщение', 'сообщения', 'сообщений')}</small></span>
+      ${adm ? '' : `<button class="u-btn ${u.blocked ? 'un' : ''}" data-block="${u.id}">${icon(u.blocked ? 'unlock' : 'ban')}<span>${u.blocked ? 'Разблокировать' : 'Блок'}</span></button>`}</div>`;
+  }).join('') : `<div class="empty-small">${icon('users')}<br>${AD.users.length ? 'Никого не найдено' : 'Пока никто не заходил'}</div>`;
+}
+$('#adminSearch').oninput = renderAdmin;
+$('#adminRefresh').onclick = () => { haptic(); loadAdmin(); };
+$('#adminFilter').onclick = e => { const b = e.target.closest('[data-v]'); if (b) { AD.filter = b.dataset.v; haptic('select'); renderAdmin(); } };
+$('#adminList').onclick = async e => {
+  const b = e.target.closest('[data-block]'); if (!b) return;
+  const u = AD.users.find(x => x.id === +b.dataset.block), nm = u.name || u.username || u.id, block = !u.blocked;
+  if (!await confirmBox(block ? `Заблокировать ${nm}? Он больше не сможет пользоваться AI Studio.` : `Разблокировать ${nm}?`)) return;
+  b.disabled = true;
+  try { const r = await (await api('/api/admin/block', { id: u.id, blocked: block })).json();
+    u.blocked = block; renderStats(r.stats); renderAdmin(); haptic(block ? 'warning' : 'success'); toast(block ? `${nm} заблокирован` : `${nm} разблокирован`, block ? 'ban' : 'unlock'); }
+  catch (er) { toast(er.message, 'alert'); haptic('error'); b.disabled = false; }
+};
+function showBlocked(text) {
+  if (text) $('#blockedText').textContent = text;
+  $('#blockedScreen').classList.remove('hidden'); haptic('error');
+}
+
 /* ---------- Init ---------- */
 (async function init() {
   const u = tg?.initDataUnsafe?.user;
@@ -623,7 +706,8 @@ $('#btnDelProvider').onclick = async () => {
     const [chats, settings, favs, providers, lastModel] = await Promise.all([DB.all(), DB.get('settings'), DB.get('favs'), DB.get('providers'), DB.get('lastModel')]);
     S.chats = chats || []; Object.assign(S.settings, settings || {}); S.favs = new Set(favs || []); S.providers = providers || []; S.lastModel = lastModel || null;
   } catch (e) { console.warn('IndexedDB', e); }
-  try { S.config = await (await api('/api/config')).json(); } catch (e) { toast(e.message, 'alert'); }
+  try { S.config = await (await api('/api/config')).json(); } catch (e) { if (!e.blocked) toast(e.message, 'alert'); }
+  if (S.config.isAdmin) { $('#navAdmin').classList.remove('hidden'); api('/api/admin/users').then(r => r.json()).then(r => renderStats(r.stats)).catch(() => { }); }
   buildModels(); newChat(); renderChatList(); updateSend();
   loadModels();
 })();
