@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ai-studio
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: ALLOWED_USERS
+        sync: false
+      - key: DEFAULT_MODEL
+        value: stealth/space-bunny-alpha
