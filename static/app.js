@@ -420,31 +420,44 @@ async function runCompletion() {
   const messages = buildMessages(model);
   S.chat.messages.push(am);
   const el = msgEl(am); $('#messages').appendChild(el); scrollBottom(true);
-  const ctrl = new AbortController(); S.streaming = { ctrl, am }; updateSend(); sphere.setActive(true);
-  const t0 = Date.now();
   const body = { model: model.id, messages, temperature: +S.settings.temp };
   if (+S.settings.maxTok > 0) body.max_tokens = +S.settings.maxTok;
   if (S.settings.reason !== 'off') body.reasoning = { effort: S.settings.reason };
   if (S.settings.tools && !model.imageOut) body.tools = true;
   if (model.imageOut) body.modalities = model.textOut === false ? ['image'] : ['image', 'text'];
   if (model.provider !== 'or') { const p = S.providers.find(x => x.id === model.provider); body.provider = { baseUrl: p?.baseUrl, apiKey: p?.apiKey }; }
-  let raf = 0;
-  let tmr = 0;
+  await streamAnswer(am, el, signal => api('/api/chat', body, signal));
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const waitVisible = () => document.visibilityState === 'visible' ? Promise.resolve() : new Promise(r => {
+  const f = () => { if (document.visibilityState === 'visible') { document.removeEventListener('visibilitychange', f); r(); } };
+  document.addEventListener('visibilitychange', f);
+});
+// Получение ответа. Если приложение свернули и связь оборвалась — сервер продолжает генерацию,
+// а мы переподключаемся и дочитываем ответ с того же места.
+async function streamAnswer(am, el, firstReq) {
+  const chat = S.chat;
+  const ctrl = new AbortController(); S.streaming = { ctrl, am }; updateSend(); sphere.setActive(true);
+  const t0 = am.t0 ||= Date.now();
+  let raf = 0, tmr = 0, n = 0;
   const schedule = () => { if (raf || tmr) return; const go = () => { raf = requestAnimationFrame(() => { raf = 0; tmr = 0; patchAssistant(el, am); scrollBottom(); }); };
     if (isLite()) tmr = setTimeout(go, 120); else go(); };
-  try {
-    const res = await api('/api/chat', body, ctrl.signal);
+  const fatal = m => Object.assign(new Error(m), { fatal: true });
+  async function consume(res) {
     const reader = res.body.getReader(), dec = new TextDecoder(); let buf = '';
     for (;;) {
-      const { done, value } = await reader.read(); if (done) break;
+      const { done, value } = await reader.read(); if (done) return false;
       buf += dec.decode(value, { stream: true });
       let nl;
       while ((nl = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
         if (!line.startsWith('data:')) continue;
-        const d = line.slice(5).trim(); if (!d || d === '[DONE]') continue;
+        const d = line.slice(5).trim(); if (!d) continue;
+        if (d === '[DONE]') return true;
+        n++;
         let j; try { j = JSON.parse(d); } catch { continue; }
-        if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+        if (j.x_job) { am.job = j.x_job; if (!S.chats.includes(chat)) S.chats.unshift(chat); saveChat(chat); continue; }
+        if (j.error) throw fatal(j.error.message || JSON.stringify(j.error));
         if (j.x_tool) { const t = am.tools.find(x => x.id === j.x_tool.id); if (t) Object.assign(t, j.x_tool); else am.tools.push(j.x_tool); haptic('select'); schedule(); continue; }
         if (j.x_file) { am.files.push(j.x_file); haptic('success'); schedule(); continue; }
         const ch = j.choices?.[0]; if (!ch) continue;
@@ -453,32 +466,58 @@ async function runCompletion() {
         else if (Array.isArray(delta.content)) for (const p of delta.content) { if (p.type === 'text') am.content += p.text; if (p.type === 'image_url') am.images.push(p.image_url.url); }
         if (delta.reasoning) am.reasoning += delta.reasoning; else if (delta.reasoning_content) am.reasoning += delta.reasoning_content;
         for (const im of delta.images || []) { const u = im.image_url?.url || im.url; if (u) am.images.push(u); }
-        if (ch.finish_reason === 'error') throw new Error('Модель вернула ошибку');
+        if (ch.finish_reason === 'error') throw fatal('Модель вернула ошибку');
         schedule();
+      }
+    }
+  }
+  try {
+    let req = firstReq, tries = 0;
+    for (;;) {
+      try {
+        if (await consume(await req(ctrl.signal))) break;
+        throw new Error('соединение оборвалось');
+      } catch (e) {
+        if (e.name === 'AbortError' || e.fatal || e.status || !am.job || ++tries > 12) throw e;
+        await waitVisible(); await sleep(tries === 1 ? 250 : 1500);
+        if (ctrl.signal.aborted) throw Object.assign(new Error('stop'), { name: 'AbortError' });
+        const from = n; req = signal => api('/api/chat/resume', { job: am.job, from }, signal);
       }
     }
     if (!am.content && !am.images.length && !am.files.length) am.error = 'Пустой ответ. Попробуйте ещё раз или выберите другую модель.';
     haptic('success');
   } catch (e) {
-    if (e.name === 'AbortError') { if (!am.content && !am.images.length && !am.files.length) am.error = 'Остановлено'; }
+    if (e.name === 'AbortError') {
+      if (am.job) fetch('/api/chat/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Init-Data': INIT }, body: JSON.stringify({ job: am.job }) }).catch(() => { });
+      if (!am.content && !am.images.length && !am.files.length) am.error = 'Остановлено';
+    }
     else { am.error = friendlyError(e.message); haptic('error'); }
   } finally {
     cancelAnimationFrame(raf); clearTimeout(tmr);
-    am.tools.forEach(t => t.status = 'done'); if (!am.tools.length) delete am.tools; if (!am.files.length) delete am.files;
-    am.pending = false; am.ms = Date.now() - t0; delete S.reasonOpen[am.id];
+    (am.tools || []).forEach(t => t.status = 'done'); if (!am.tools?.length) delete am.tools; if (!am.files?.length) delete am.files;
+    am.pending = false; am.ms = Date.now() - t0; delete am.t0; delete am.job; delete S.reasonOpen[am.id];
     S.streaming = null; updateSend(); sphere.setActive(false);
     const d = el.querySelector('details'); if (d) d.open = false;
     patchAssistant(el, am); scrollBottom();
-    await saveChat(S.chat); renderChatList();
+    await saveChat(chat); renderChatList();
   }
 }
-function friendlyError(m) {
-  if (/data policy|No endpoints found matching/i.test(m)) return m + '\n\nВключите бесплатные модели: openrouter.ai → Settings → Privacy.';
-  if (/rate.?limit|429/i.test(m)) return 'Слишком много запросов к модели (лимит бесплатного тарифа). Подождите минуту или выберите другую модель.';
-  if (/credits|402|insufficient/i.test(m)) return 'Недостаточно средств на OpenRouter для этой модели. Выберите бесплатную (FREE).';
-  return m;
+// Приложение закрыли полностью, пока шёл ответ — после открытия дочитываем его с сервера
+async function resumePending() {
+  const pend = [];
+  for (const c of S.chats) for (const m of c.messages) if (m.pending) pend.push({ c, m });
+  if (!pend.length) return;
+  pend.sort((a, b) => (b.c.updatedAt || 0) - (a.c.updatedAt || 0));
+  const top = pend[0].m.job && Date.now() - (pend[0].m.t0 || 0) < 25 * 60 * 1000 ? pend.shift() : null;
+  for (const { c, m } of pend) { m.pending = false; m.error ||= 'Ответ прервался'; delete m.job; delete m.t0; saveChat(c); }
+  if (!top) return;
+  const { c, m } = top;
+  openChat(c.id);
+  Object.assign(m, { content: '', reasoning: '', images: [], tools: [], files: [] });
+  const el = findMsgEl(m.id); if (!el) return;
+  patchAssistant(el, m); scrollBottom(true);
+  await streamAnswer(m, el, signal => api('/api/chat/resume', { job: m.job, from: 0 }, signal));
 }
-function stop() { S.streaming?.ctrl.abort(); }
 
 /* ---------- Model picker ---------- */
 const FILTERS = [['all', 'Все', 'layers'], ['fav', 'Избранное', 'star'], ['free', 'Бесплатные', 'gift'], ['vision', 'Видят фото', 'eye'], ['gen', 'Рисуют', 'wand'], ['own', 'Мои API', 'key']];
@@ -727,6 +766,7 @@ function showBlocked(text) {
   try { S.config = await (await api('/api/config')).json(); } catch (e) { if (!e.blocked) toast(e.message, 'alert'); }
   if (S.config.isAdmin) { $('#navAdmin').classList.remove('hidden'); api('/api/admin/users').then(r => r.json()).then(r => renderStats(r.stats)).catch(() => { }); }
   buildModels(); newChat(); renderChatList(); updateSend();
+  resumePending().catch(e => console.warn('resume', e));
   loadModels();
 })();
 })();
