@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover,user-scalable=no">
 <title>AI Studio</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>window.__tgHash = location.hash;</script>
+<script src="/tg-sdk.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Unbounded:wght@500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/app.css">
@@ -89,6 +90,11 @@
       <div class="card-title"><span class="ct-ic"><i data-i="brain"></i></span>Глубина размышлений</div>
       <div class="seg" id="setReason"><button data-v="off">Выкл</button><button data-v="low">Мало</button><button data-v="medium">Средне</button><button data-v="high">Много</button></div>
       <label class="toggle"><input type="checkbox" id="setShowReason"><span></span>Показывать ход мыслей</label>
+    </section>
+    <section class="card">
+      <div class="card-title"><span class="ct-ic"><i data-i="zap"></i></span>Быстродействие</div>
+      <label class="toggle"><input type="checkbox" id="setLite"><span></span>Облегчённый режим</label>
+      <p class="hint" id="liteHint">Отключает тяжёлые эффекты: живой фон, размытие стекла и часть анимаций. Включите, если приложение тормозит.</p>
     </section>
     <section class="card">
       <div class="card-title"><span class="ct-ic"><i data-i="wrench"></i></span>Инструменты</div>

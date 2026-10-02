@@ -18,8 +18,11 @@
       const x = (k % 1) * 3, i = Math.floor(x), f = x - i, A = c[i], B = c[i + 1];
       return `rgba(${A[0] + (B[0] - A[0]) * f | 0},${A[1] + (B[1] - A[1]) * f | 0},${A[2] + (B[2] - A[2]) * f | 0},${a})`;
     };
+    let skip = false;
     function frame() {
       raf = 0; if (!visible || !w) return;
+      const lite = document.documentElement.classList.contains('lite');
+      if (lite && (skip = !skip)) { raf = requestAnimationFrame(frame); return; } // 30 к/с
       t += 1 / 60; energy += (target - energy) * 0.05;
       if (!drag) rotY += vx * (1 + energy * 4);
       ctx.setTransform(DPR, 0, 0, DPR, 0, 0); ctx.clearRect(0, 0, w, h);
@@ -30,7 +33,7 @@
       ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
       const sy = Math.sin(rotY), cyy = Math.cos(rotY), sx = Math.sin(rotX), cxx = Math.cos(rotX);
       const proj = [];
-      for (const [x0, y0, z0, s] of pts) {
+      for (let k = 0; k < pts.length; k += lite ? 2 : 1) { const [x0, y0, z0, s] = pts[k];
         const wob = 1 + (Math.sin(t * 2.2 + y0 * 6 + s * 6) * 0.03) * (0.4 + energy * 2.2);
         let x = x0 * cyy - z0 * sy, z = x0 * sy + z0 * cyy, y = y0;
         const y2 = y * cxx - z * sx, z2 = y * sx + z * cxx;

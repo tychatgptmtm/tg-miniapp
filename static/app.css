@@ -423,3 +423,16 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;heigh
 .bl-ic .ic{width:34px;height:34px}
 .blocked h2{font:600 24px var(--display);margin:0 0 8px;letter-spacing:-.02em}
 .blocked p{color:var(--muted);max-width:300px;margin:0;line-height:1.5}
+
+/* ---------- Облегчённый режим (слабые телефоны) ---------- */
+.lite .aurora i{display:none}
+.lite .aurora{background:radial-gradient(70vmax 60vmax at 10% 0%,rgba(124,58,237,.38),transparent 70%),radial-gradient(60vmax 50vmax at 100% 30%,rgba(37,99,235,.3),transparent 70%),radial-gradient(60vmax 45vmax at 20% 100%,rgba(219,39,119,.2),transparent 70%)}
+[data-theme=light].lite .aurora{opacity:.45}
+.lite .grain{display:none}
+.lite .topbar,.lite .composer,.lite .drawer,.lite .sheet,.lite .search,.lite .card,.lite .model-chip,.lite .toast,.lite .chip,.lite .suggest button,.lite .to-bottom,.lite .scrim,.lite .viewer-nav,.lite .viewer-bar{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+.lite .scrim{background:rgba(0,0,0,.55)}
+.lite .topbar{background:var(--bg)}
+.lite .drawer,.lite .sheet,.lite .toast{background:var(--bg2)}
+.lite .composer,.lite .model-chip,.lite .search,.lite .chip,.lite .suggest button{background:color-mix(in srgb,var(--bg2) 92%,#888 8%)}
+.lite .composer::after{display:none}
+.lite .msg,.lite .card,.lite .urow,.lite .tool,.lite .fcard,.lite .stat,.lite .model-row,.lite .gallery button{animation:none!important}

@@ -8,7 +8,9 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const try_ = f => { try { return f(); } catch { } };
 const haptic = (t = 'light') => try_(() => t === 'success' || t === 'error' || t === 'warning' ? tg.HapticFeedback.notificationOccurred(t)
   : t === 'select' ? tg.HapticFeedback.selectionChanged() : tg.HapticFeedback.impactOccurred(t));
-const inTG = !!tg?.initData;
+// запасной вариант: данные входа из адреса страницы (#tgWebAppData=…), если скрипт Telegram не загрузился
+const INIT = tg?.initData || try_(() => new URLSearchParams((window.__tgHash || '').slice(1)).get('tgWebAppData')) || '';
+const inTG = !!INIT;
 hydrateIcons();
 
 /* ---------- Telegram & theme ---------- */
@@ -25,7 +27,7 @@ applyTheme();
 async function api(path, body, signal) {
   const r = await fetch(path, {
     method: body ? 'POST' : 'GET', signal,
-    headers: { 'Content-Type': 'application/json', 'X-Init-Data': tg?.initData || '' },
+    headers: { 'Content-Type': 'application/json', 'X-Init-Data': INIT },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!r.ok) {
@@ -63,7 +65,7 @@ const DB = (() => {
 const S = {
   config: { defaultModel: 'stealth/space-bunny-alpha' },
   chats: [], chat: null, models: [], orModels: [], favs: new Set(), providers: [],
-  settings: { system: '', temp: 0.7, reason: 'off', showReason: true, maxTok: '', tools: true },
+  settings: { system: '', temp: 0.7, reason: 'off', showReason: true, maxTok: '', tools: true, lite: null },
   lastModel: null, attachments: [], streaming: null, filter: 'all', galFilter: 'all', reasonOpen: {},
 };
 const saveSettings = () => DB.set('settings', S.settings);
@@ -298,10 +300,10 @@ const toolIcon = n => ({ create_files: 'file', web_search: 'search', fetch_url: 
 const fmtSize = b => b < 1024 ? `${b} Б` : b < 1048576 ? `${(b / 1024).toFixed(1)} КБ` : `${(b / 1048576).toFixed(1)} МБ`;
 function downloadFile(f) {
   const url = new URL(f.url, location.href).href; haptic();
-  if (inTG && tg.downloadFile && tg.isVersionAtLeast?.('8.0')) {
+  if (inTG && tg?.downloadFile && tg.isVersionAtLeast?.('8.0')) {
     try { tg.downloadFile({ url, file_name: f.name }, ok => ok && toast('Загрузка началась', 'download')); return; } catch { }
   }
-  if (inTG && tg.openLink) { tg.openLink(url); return; }
+  if (inTG && tg?.openLink) { tg.openLink(url); return; }
   const a = document.createElement('a'); a.href = url; a.download = f.name; a.target = '_blank'; a.click();
 }
 const findMsgEl = id => $('#messages').querySelector(`.msg[data-id="${id}"]`);
@@ -427,7 +429,9 @@ async function runCompletion() {
   if (model.imageOut) body.modalities = model.textOut === false ? ['image'] : ['image', 'text'];
   if (model.provider !== 'or') { const p = S.providers.find(x => x.id === model.provider); body.provider = { baseUrl: p?.baseUrl, apiKey: p?.apiKey }; }
   let raf = 0;
-  const schedule = () => { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; patchAssistant(el, am); scrollBottom(); }); };
+  let tmr = 0;
+  const schedule = () => { if (raf || tmr) return; const go = () => { raf = requestAnimationFrame(() => { raf = 0; tmr = 0; patchAssistant(el, am); scrollBottom(); }); };
+    if (isLite()) tmr = setTimeout(go, 120); else go(); };
   try {
     const res = await api('/api/chat', body, ctrl.signal);
     const reader = res.body.getReader(), dec = new TextDecoder(); let buf = '';
@@ -459,7 +463,7 @@ async function runCompletion() {
     if (e.name === 'AbortError') { if (!am.content && !am.images.length && !am.files.length) am.error = 'Остановлено'; }
     else { am.error = friendlyError(e.message); haptic('error'); }
   } finally {
-    cancelAnimationFrame(raf);
+    cancelAnimationFrame(raf); clearTimeout(tmr);
     am.tools.forEach(t => t.status = 'done'); if (!am.tools.length) delete am.tools; if (!am.files.length) delete am.files;
     am.pending = false; am.ms = Date.now() - t0; delete S.reasonOpen[am.id];
     S.streaming = null; updateSend(); sphere.setActive(false);
@@ -584,11 +588,23 @@ $('#vChat').onclick = () => {
   setTimeout(() => findMsgEl(x.msgId)?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 60);
 };
 
+/* ---------- Облегчённый режим ---------- */
+const weakDevice = () => (navigator.deviceMemory && navigator.deviceMemory <= 4) || (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4)
+  || matchMedia('(prefers-reduced-motion: reduce)').matches;
+const isLite = () => S.settings.lite ?? (S.autoLite || weakDevice());
+const applyLite = () => document.documentElement.classList.toggle('lite', !!isLite());
+function measureFps() { // если в авто-режиме кадров мало — включаем облегчённый
+  if (S.settings.lite !== null || isLite()) return;
+  let n = 0; const t0 = performance.now();
+  const f = () => { n++; if (performance.now() - t0 < 2000) requestAnimationFrame(f); else if (n / 2 < 40) { S.autoLite = true; applyLite(); } };
+  requestAnimationFrame(f);
+}
+
 /* ---------- Settings ---------- */
 function renderSettings() {
   const s = S.settings;
   $('#setSystem').value = s.system; $('#setTemp').value = s.temp; $('#tempVal').textContent = (+s.temp).toFixed(1);
-  $('#setMaxTok').value = s.maxTok; $('#setShowReason').checked = s.showReason; $('#setTools').checked = s.tools;
+  $('#setMaxTok').value = s.maxTok; $('#setShowReason').checked = s.showReason; $('#setTools').checked = s.tools; $('#setLite').checked = !!isLite();
   document.querySelectorAll('#setReason button').forEach(b => b.classList.toggle('on', b.dataset.v === s.reason));
   $('#providerList').innerHTML = S.providers.map(p => `<button class="prov" data-pid="${p.id}">${logo({ id: p.name, name: p.name, provider: p.id, providerName: p.name, baseUrl: p.baseUrl })}
     <div class="t"><b>${esc(p.name)}</b><small>${p.models.length} моделей · ${esc(p.baseUrl.replace(/^https?:\/\//, ''))}</small></div>${icon('chevRight')}</button>`).join('');
@@ -596,6 +612,7 @@ function renderSettings() {
 $('#setSystem').oninput = e => { S.settings.system = e.target.value; saveSettings(); };
 $('#setTemp').oninput = e => { S.settings.temp = +e.target.value; $('#tempVal').textContent = (+e.target.value).toFixed(1); saveSettings(); haptic('select'); };
 $('#setMaxTok').oninput = e => { S.settings.maxTok = e.target.value; saveSettings(); };
+$('#setLite').onchange = e => { S.settings.lite = e.target.checked; saveSettings(); applyLite(); haptic('select'); };
 $('#setTools').onchange = e => { S.settings.tools = e.target.checked; saveSettings(); haptic('select'); };
 $('#setShowReason').onchange = e => { S.settings.showReason = e.target.checked; saveSettings(); haptic('select'); };
 $('#setReason').onclick = e => { const b = e.target.closest('[data-v]'); if (!b) return; S.settings.reason = b.dataset.v; haptic('select'); saveSettings(); renderSettings(); };
@@ -706,6 +723,7 @@ function showBlocked(text) {
     const [chats, settings, favs, providers, lastModel] = await Promise.all([DB.all(), DB.get('settings'), DB.get('favs'), DB.get('providers'), DB.get('lastModel')]);
     S.chats = chats || []; Object.assign(S.settings, settings || {}); S.favs = new Set(favs || []); S.providers = providers || []; S.lastModel = lastModel || null;
   } catch (e) { console.warn('IndexedDB', e); }
+  applyLite(); setTimeout(measureFps, 1200);
   try { S.config = await (await api('/api/config')).json(); } catch (e) { if (!e.blocked) toast(e.message, 'alert'); }
   if (S.config.isAdmin) { $('#navAdmin').classList.remove('hidden'); api('/api/admin/users').then(r => r.json()).then(r => renderStats(r.stats)).catch(() => { }); }
   buildModels(); newChat(); renderChatList(); updateSend();
